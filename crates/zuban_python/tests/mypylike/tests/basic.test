@@ -1736,7 +1736,7 @@ a: int = "# type: ignore"  # E: Incompatible types in assignment (expression has
 b: int = "# zuban: ignore"  # E: Incompatible types in assignment (expression has type "str", variable has type "int")
 c: int = "# type: ignore[assignment]"  # E: Incompatible types in assignment (expression has type "str", variable has type "int")
 d: int = "# type: ignore in the middle of a string"  # E: Incompatible types in assignment (expression has type "str", variable has type "int")
-e: int = "# zuban: ignore "  # E: Incompatible types in assignment (expression has type "str", variable has type "int")
+e: int = "# zuban: ignore[assignment] "  # E: Incompatible types in assignment (expression has type "str", variable has type "int")
 f: int = "# type: ignore[assignment] and more"  # E: Incompatible types in assignment (expression has type "str", variable has type "int")
 # An actual ignore comment still suppresses, even with the marker in a string
 g: int = "# type: ignore"  # type: ignore
