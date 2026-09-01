@@ -1,5 +1,7 @@
 use parsa_python::CodeIndex;
 
+use crate::Tree;
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum TypeIgnoreComment<'db> {
     WithCodes {
@@ -12,7 +14,8 @@ pub enum TypeIgnoreComment<'db> {
 }
 
 /// The `# type: ignore` / `# zuban: ignore` comments of a file (at most one per kind and line,
-/// like in Mypy), scanned once and ordered by position.
+/// like in Mypy), scanned once and ordered by position. Only actual comments are scanned, a `#`
+/// within e.g. a string literal is never treated as a comment.
 #[derive(Debug, Clone, Default)]
 pub struct IgnoreDirectives {
     entries: Vec<IgnoreDirective>,
@@ -30,34 +33,30 @@ pub struct IgnoreDirective {
 }
 
 impl IgnoreDirectives {
-    pub fn scan(code: &str) -> Self {
+    pub fn scan(tree: &Tree) -> Self {
+        let code = tree.code();
         let mut entries = vec![];
-        let mut line_start: CodeIndex = 0;
-        for line in code.split(['\n', '\r']) {
-            let mut iterator = line.split('#');
-            // The first part precedes any `#` and can therefore not contain a comment
-            let mut comment_start = line_start + iterator.next().unwrap().len() as CodeIndex + 1;
-            let mut seen_type = false;
-            let mut seen_zuban = false;
-            for comment in iterator {
-                if let Some(directive) = maybe_ignore_directive_in_comment(comment, comment_start) {
-                    // Like Mypy, only honor the leftmost `type: ignore` comment on a line and
-                    // treat later ones as prose. The same holds for `zuban: ignore` comments,
-                    // but one comment of each kind can be combined on a line (see GH #331).
-                    // Unlike Mypy we still scan later `#` segments when earlier ones are no
-                    // ignore comments, because a `#` might e.g. appear within a string, which
-                    // this text-based scan cannot rule out.
-                    let seen = match directive.kind {
-                        "zuban" => &mut seen_zuban,
-                        _ => &mut seen_type,
-                    };
-                    if !std::mem::replace(seen, true) {
-                        entries.push(directive);
-                    }
-                }
-                comment_start += comment.len() as CodeIndex + 1;
+        let mut pos = 0;
+        while let Some(found) = code[pos..].find('#') {
+            let hash_start = pos + found;
+            let leaf = tree.0.leaf_by_position(hash_start as CodeIndex);
+            if (leaf.start() as usize) <= hash_start && hash_start < leaf.end() as usize {
+                // The '#' is part of a token (e.g. within a string literal) and is therefore
+                // not a comment
+                pos = hash_start + 1;
+                continue;
             }
-            line_start += line.len() as CodeIndex + 1;
+            // A '#' outside of tokens starts a comment that runs to the end of the line
+            let comment_end = code[hash_start..]
+                .find(['\n', '\r'])
+                .map(|newline| hash_start + newline)
+                .unwrap_or(code.len());
+            scan_comment(
+                &code[hash_start..comment_end],
+                hash_start as CodeIndex,
+                &mut entries,
+            );
+            pos = comment_end;
         }
         Self { entries }
     }
@@ -145,6 +144,39 @@ impl IgnoreDirective {
     }
 }
 
+/// Scans the text of a single comment (starting at its leading `#` and ending at the end of the
+/// line) for ignore directives.
+///
+/// Like Mypy, only the leftmost `type: ignore` within the comment is honored and later ones are
+/// treated as prose. The same holds for `zuban: ignore`, but one directive of each kind can be
+/// combined within a comment (see GH #331). Unlike Mypy, a directive is also honored when it
+/// appears after unrelated comment text, so that suppressions of multiple tools can be stacked,
+/// e.g. `# noqa # type: ignore` or `# ty: ignore[x]  # zuban: ignore[y]`.
+fn scan_comment(
+    comment_text: &str,
+    comment_hash_start: CodeIndex,
+    entries: &mut Vec<IgnoreDirective>,
+) {
+    let mut iterator = comment_text.split('#');
+    // The first part is the empty text before the comment's leading `#`
+    iterator.next();
+    let mut segment_start = comment_hash_start + 1;
+    let mut seen_type = false;
+    let mut seen_zuban = false;
+    for segment in iterator {
+        if let Some(directive) = maybe_ignore_directive_in_comment(segment, segment_start) {
+            let seen = match directive.kind {
+                "zuban" => &mut seen_zuban,
+                _ => &mut seen_type,
+            };
+            if !std::mem::replace(seen, true) {
+                entries.push(directive);
+            }
+        }
+        segment_start += segment.len() as CodeIndex + 1;
+    }
+}
+
 fn maybe_ignore_directive_in_comment(
     comment: &str,
     comment_start: CodeIndex,
@@ -210,28 +242,47 @@ pub fn maybe_type_ignore<'db>(
 mod tests {
     use super::*;
 
-    fn spans(code: &str) -> Vec<(CodeIndex, &'static str, Option<&str>)> {
-        IgnoreDirectives::scan(code)
+    fn spans(code: &str) -> Vec<(CodeIndex, &'static str, Option<String>)> {
+        let tree = Tree::parse(code.into());
+        IgnoreDirectives::scan(&tree)
             .entries()
             .iter()
-            .map(|entry| (entry.hash_start, entry.kind, entry.codes(code)))
+            .map(|entry| {
+                (
+                    entry.hash_start,
+                    entry.kind,
+                    entry.codes(tree.code()).map(str::to_string),
+                )
+            })
+            .collect()
+    }
+
+    fn expect(
+        entries: &[(CodeIndex, &'static str, Option<&str>)],
+    ) -> Vec<(CodeIndex, &'static str, Option<String>)> {
+        entries
+            .iter()
+            .map(|&(start, kind, codes)| (start, kind, codes.map(str::to_string)))
             .collect()
     }
 
     #[test]
     fn scan_bare_and_coded() {
-        assert_eq!(spans("x = 1  # type: ignore\n"), [(7, "type", None)]);
+        assert_eq!(
+            spans("x = 1  # type: ignore\n"),
+            expect(&[(7, "type", None)])
+        );
         assert_eq!(
             spans("x = 1  # type: ignore[assignment]\n"),
-            [(7, "type", Some("assignment"))]
+            expect(&[(7, "type", Some("assignment"))])
         );
         // Multiple codes with weird spacing keep the raw bracket interior
         assert_eq!(
             spans("x = 1  # type: ignore   [ a , b ]\n"),
-            [(7, "type", Some(" a , b "))]
+            expect(&[(7, "type", Some(" a , b "))])
         );
         // Tolerates missing trailing newline
-        assert_eq!(spans("x = 1  # type: ignore"), [(7, "type", None)]);
+        assert_eq!(spans("x = 1  # type: ignore"), expect(&[(7, "type", None)]));
     }
 
     #[test]
@@ -242,54 +293,75 @@ mod tests {
         assert_eq!(spans("x = 1  # type: ignore[a] trailing\n"), []);
         assert_eq!(spans("x = 1  # types: ignore\n"), []);
         // `ignore` directly followed by a comment end or whitespace is fine though
-        assert_eq!(spans("x = 1  # type: ignore more\n"), [(7, "type", None)]);
+        assert_eq!(
+            spans("x = 1  # type: ignore more\n"),
+            expect(&[(7, "type", None)])
+        );
+    }
+
+    #[test]
+    fn scan_only_finds_actual_comments() {
+        // A '#' within a string is not a comment
+        assert_eq!(spans("x = '# type: ignore '\n"), []);
+        assert_eq!(spans("x = 'foo # type: ignore[a]'\n"), []);
+        assert_eq!(spans("x = '''\n# type: ignore\n'''\n"), []);
+        assert_eq!(spans("x = f'{1} # type: ignore '\n"), []);
+        // An actual comment after a string containing a '#' is found
+        assert_eq!(
+            spans("url = 'http://x#y'  # type: ignore[a]\n"),
+            expect(&[(20, "type", Some("a"))])
+        );
+        assert_eq!(
+            spans("x = '# type: ignore '  # type: ignore[a]\n"),
+            expect(&[(23, "type", Some("a"))])
+        );
     }
 
     #[test]
     fn scan_kinds_and_leftmost_ignore_comment_wins() {
         assert_eq!(
             spans("x = 1  # zuban: ignore[foo]\n"),
-            [(7, "zuban", Some("foo"))]
+            expect(&[(7, "zuban", Some("foo"))])
         );
-        // An ignore comment after a non-ignore comment is still found, since the first `#`
-        // might e.g. be part of a string
+        // An ignore directive after unrelated comment text is honored, so that suppressions
+        // of multiple tools can be stacked (e.g. `# noqa # type: ignore`)
         assert_eq!(
             spans("x = 1  # a comment # type: ignore[a]\n"),
-            [(19, "type", Some("a"))]
-        );
-        assert_eq!(
-            spans("url = 'http://x#y'  # type: ignore[a]\n"),
-            [(20, "type", Some("a"))]
+            expect(&[(19, "type", Some("a"))])
         );
         // Like in Mypy, only the leftmost ignore comment of a kind on a line is honored
         assert_eq!(
             spans("x = 1  # type: ignore[a] # type: ignore\n"),
-            [(7, "type", Some("a"))]
+            expect(&[(7, "type", Some("a"))])
         );
         assert_eq!(
             spans("x = 1  # type: ignore # type: ignore[a]\n"),
-            [(7, "type", None)]
+            expect(&[(7, "type", None)])
         );
         // However one comment of each kind can be combined on a line (see GH #331)
         assert_eq!(
             spans("x = 1  # type: ignore[a] # zuban: ignore[b]\n"),
-            [(7, "type", Some("a")), (25, "zuban", Some("b"))]
+            expect(&[(7, "type", Some("a")), (25, "zuban", Some("b"))])
         );
     }
 
     #[test]
     fn scan_offsets_across_lines() {
         let code = "x = 1\ny = 2  # type: ignore[a]\nz = 3\na = 4  # zuban: ignore\n";
-        assert_eq!(spans(code), [(13, "type", Some("a")), (44, "zuban", None)]);
+        assert_eq!(
+            spans(code),
+            expect(&[(13, "type", Some("a")), (44, "zuban", None)])
+        );
         // Windows line endings
         let code = "x = 1\r\ny = 2  # type: ignore[a]\r\n";
-        assert_eq!(spans(code), [(14, "type", Some("a"))]);
+        assert_eq!(spans(code), expect(&[(14, "type", Some("a"))]));
     }
 
     #[test]
     fn lookup_same_line() {
-        let code = "x = 1  # type: ignore[a]\ny = 2\n";
-        let directives = IgnoreDirectives::scan(code);
+        let tree = Tree::parse("x = 1  # type: ignore[a]\ny = 2\n".into());
+        let code = tree.code();
+        let directives = IgnoreDirectives::scan(&tree);
         let expected = || {
             Some(TypeIgnoreComment::WithCodes {
                 codes: "a",
@@ -307,9 +379,12 @@ mod tests {
 
     #[test]
     fn lookup_over_multiple_lines() {
-        let code =
-            "foo(  # type: ignore[a]\n    1,  # type: ignore[b]\n    2,\n)  # type: ignore\n";
-        let directives = IgnoreDirectives::scan(code);
+        let tree = Tree::parse(
+            "foo(  # type: ignore[a]\n    1,  # type: ignore[b]\n    2,\n)  # type: ignore\n"
+                .into(),
+        );
+        let code = tree.code();
+        let directives = IgnoreDirectives::scan(&tree);
         // A lookup that only spans the first line
         assert_eq!(
             directives.type_ignore_comment_for(code, 0, 3),
@@ -339,8 +414,9 @@ mod tests {
 
     #[test]
     fn lookup_bare_ignore_wins_in_both_directions() {
-        let code = "foo(  # type: ignore\n    1,  # type: ignore[b]\n)\n";
-        let directives = IgnoreDirectives::scan(code);
+        let tree = Tree::parse("foo(  # type: ignore\n    1,  # type: ignore[b]\n)\n".into());
+        let code = tree.code();
+        let directives = IgnoreDirectives::scan(&tree);
         assert_eq!(
             directives.type_ignore_comment_for(code, 0, 26),
             Some(TypeIgnoreComment::WithoutCode)

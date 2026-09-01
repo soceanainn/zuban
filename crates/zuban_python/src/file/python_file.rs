@@ -310,7 +310,7 @@ impl<'db> PythonFile {
     ) -> Self {
         let is_stub = file_entry.name.ends_with(".pyi");
         let issues = Diagnostics::default();
-        let ignore_directives = IgnoreDirectives::scan(tree.code());
+        let ignore_directives = IgnoreDirectives::scan(&tree);
         let mut ignore_type_errors = tree
             .has_type_ignore_at_start(&ignore_directives)
             .map(|has_ignore| has_ignore.then_some(IgnoreFileReason::TypeIgnoreAtTopOfFile))
@@ -511,7 +511,7 @@ impl<'db> PythonFile {
             code = Cow::Owned(code.replace('\n', " "));
         }
         let tree = Tree::parse(code.into_owned().into_boxed_str());
-        let ignore_directives = IgnoreDirectives::scan(tree.code());
+        let ignore_directives = IgnoreDirectives::scan(&tree);
         let points = Points::new(tree.length());
         let f = db.load_sub_file(self, |file_index| {
             let mut file = PythonFile::new_internal(
