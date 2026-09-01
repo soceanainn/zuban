@@ -13,9 +13,9 @@ pub enum TypeIgnoreComment<'db> {
     WithoutCode,
 }
 
-/// All `# type: ignore` / `# zuban: ignore` comments of a file, scanned once and ordered by
-/// position. Only actual comments are scanned, a `#` within e.g. a string literal is never
-/// treated as a comment.
+/// The `# type: ignore` / `# zuban: ignore` comments of a file (at most one per kind and line,
+/// like in Mypy), scanned once and ordered by position. Only actual comments are scanned, a `#`
+/// within e.g. a string literal is never treated as a comment.
 #[derive(Debug, Clone, Default)]
 pub struct IgnoreDirectives {
     entries: Vec<IgnoreDirective>,
@@ -82,9 +82,9 @@ impl IgnoreDirectives {
         self.fold_in_range(code, start, end_of_last_line)
     }
 
-    /// Merges all directives whose comments start within `start..end`, with the same semantics
-    /// the previous per-issue text scan had: multiple coded ignores accumulate their codes, while
-    /// any bare ignore makes the result a bare ignore.
+    /// Merges all directives whose comments start within `start..end`: coded ignores (on
+    /// multiple lines) accumulate their codes, while any bare ignore makes the result a bare
+    /// ignore.
     pub(crate) fn fold_in_range<'code>(
         &self,
         code: &'code str,
@@ -145,9 +145,13 @@ impl IgnoreDirective {
 }
 
 /// Scans the text of a single comment (starting at its leading `#` and ending at the end of the
-/// line) for ignore directives. Directives after unrelated comment text are also honored, so
-/// that suppressions of multiple tools can be stacked, e.g. `# noqa # type: ignore` or
-/// `# ty: ignore[x]  # zuban: ignore[y]`.
+/// line) for ignore directives.
+///
+/// Like Mypy, only the leftmost `type: ignore` within the comment is honored and later ones are
+/// treated as prose. The same holds for `zuban: ignore`, but one directive of each kind can be
+/// combined within a comment (see GH #331). Unlike Mypy, a directive is also honored when it
+/// appears after unrelated comment text, so that suppressions of multiple tools can be stacked,
+/// e.g. `# noqa # type: ignore` or `# ty: ignore[x]  # zuban: ignore[y]`.
 fn scan_comment(
     comment_text: &str,
     comment_hash_start: CodeIndex,
@@ -157,9 +161,17 @@ fn scan_comment(
     // The first part is the empty text before the comment's leading `#`
     iterator.next();
     let mut segment_start = comment_hash_start + 1;
+    let mut seen_type = false;
+    let mut seen_zuban = false;
     for segment in iterator {
         if let Some(directive) = maybe_ignore_directive_in_comment(segment, segment_start) {
-            entries.push(directive);
+            let seen = match directive.kind {
+                "zuban" => &mut seen_zuban,
+                _ => &mut seen_type,
+            };
+            if !std::mem::replace(seen, true) {
+                entries.push(directive);
+            }
         }
         segment_start += segment.len() as CodeIndex + 1;
     }
@@ -306,26 +318,30 @@ mod tests {
     }
 
     #[test]
-    fn scan_kinds_and_multiple_comments_per_line() {
+    fn scan_kinds_and_leftmost_ignore_comment_wins() {
         assert_eq!(
             spans("x = 1  # zuban: ignore[foo]\n"),
             expect(&[(7, "zuban", Some("foo"))])
         );
-        // Note that the conventional way to ignore multiple error codes is the comma syntax
-        // (`# type: ignore[a, b]`, a single directive). Multiple ignore directives within a
-        // comment are nevertheless scanned separately, and their codes accumulate on lookup.
-        // A directive after unrelated comment text is honored as well
+        // An ignore directive after unrelated comment text is honored, so that suppressions
+        // of multiple tools can be stacked (e.g. `# noqa # type: ignore`)
         assert_eq!(
             spans("x = 1  # a comment # type: ignore[a]\n"),
             expect(&[(19, "type", Some("a"))])
         );
+        // Like in Mypy, only the leftmost ignore comment of a kind on a line is honored
+        assert_eq!(
+            spans("x = 1  # type: ignore[a] # type: ignore\n"),
+            expect(&[(7, "type", Some("a"))])
+        );
+        assert_eq!(
+            spans("x = 1  # type: ignore # type: ignore[a]\n"),
+            expect(&[(7, "type", None)])
+        );
+        // However one comment of each kind can be combined on a line (see GH #331)
         assert_eq!(
             spans("x = 1  # type: ignore[a] # zuban: ignore[b]\n"),
             expect(&[(7, "type", Some("a")), (25, "zuban", Some("b"))])
-        );
-        assert_eq!(
-            spans("x = 1  # type: ignore[a] # type: ignore\n"),
-            expect(&[(7, "type", Some("a")), (25, "type", None)])
         );
     }
 
