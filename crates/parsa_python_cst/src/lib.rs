@@ -5,6 +5,7 @@ mod match_stmt;
 mod ranges;
 mod signatures;
 mod strings;
+mod type_ignores;
 
 use std::{
     borrow::Cow,
@@ -29,6 +30,7 @@ use parsa_python::{
 pub use ranges::Range;
 pub use signatures::{SignatureArg, SignatureArgsIterator, SignatureBase};
 pub use strings::PythonString;
+pub use type_ignores::{IgnoreDirective, IgnoreDirectives, TypeIgnoreComment, maybe_type_ignore};
 
 pub const NAME_DEF_TO_NAME_DIFFERENCE: u32 = 1;
 
@@ -98,92 +100,9 @@ impl Tree {
         leaf.end()
     }
 
-    pub fn type_ignore_comment_for(
-        &self,
-        start: CodeIndex,
-        end: CodeIndex,
-    ) -> Option<TypeIgnoreComment<'_>> {
-        // Returns Some(None) when there is a type: ignore
-        // Returns Some("foo") when there is a type: ignore['foo']
-        let code = self.code();
-        let region_end = match code[end as usize..].find(['\n', '\r']) {
-            Some(newline) => end as usize + newline,
-            None => code.len(),
-        };
-        self.type_ignore_comment_in_region(start as usize, region_end)
-    }
-
-    /// Searches the comments between `start` and `end` for ignore directives. Only actual
-    /// comments are considered, a `#` within e.g. a string literal is never treated as a
-    /// comment.
-    fn type_ignore_comment_in_region(
-        &self,
-        start: usize,
-        end: usize,
-    ) -> Option<TypeIgnoreComment<'_>> {
-        let code = self.code();
-        let mut result = None;
-        let mut pos = start;
-        while pos < end {
-            let Some(found) = code[pos..end].find('#') else {
-                break;
-            };
-            let hash_start = pos + found;
-            let leaf = self.0.leaf_by_position(hash_start as CodeIndex);
-            if (leaf.start() as usize) <= hash_start && hash_start < leaf.end() as usize {
-                // The '#' is part of a token (e.g. within a string literal) and is
-                // therefore not a comment
-                pos = hash_start + 1;
-                continue;
-            }
-            // A '#' outside of tokens starts a comment that runs to the end of the line
-            let comment_end = code[hash_start..end]
-                .find(['\n', '\r'])
-                .map(|newline| hash_start + newline)
-                .unwrap_or(end);
-            let mut segment_start = hash_start as CodeIndex + 1;
-            for segment in code[hash_start + 1..comment_end].split('#') {
-                let rest = segment.trim_start_matches(' ');
-                let mut kind = "type";
-                if let Some(ignore) = rest.strip_prefix("type:").or_else(|| {
-                    kind = "zuban";
-                    rest.strip_prefix("zuban:")
-                }) {
-                    let ignore = ignore.trim_start_matches(' ');
-                    let new = maybe_type_ignore(
-                        kind,
-                        segment_start + (segment.len() - ignore.len()) as CodeIndex,
-                        ignore,
-                    );
-                    if let Some(new) = new {
-                        if let Some(old) = &mut result {
-                            match (old, new) {
-                                (
-                                    TypeIgnoreComment::WithCodes {
-                                        codes_of_later_type_ignores,
-                                        ..
-                                    },
-                                    TypeIgnoreComment::WithCodes {
-                                        codes: new_codes, ..
-                                    },
-                                ) => codes_of_later_type_ignores.push(new_codes),
-                                (old, _) => *old = TypeIgnoreComment::WithoutCode,
-                            }
-                        } else {
-                            result = Some(new);
-                        }
-                    }
-                }
-                segment_start += segment.len() as CodeIndex + 1;
-            }
-            pos = comment_end;
-        }
-        result
-    }
-
-    pub fn has_type_ignore_at_start(&self) -> Result<bool, &str> {
+    pub fn has_type_ignore_at_start(&self, directives: &IgnoreDirectives) -> Result<bool, &str> {
         let before_first_statement_end = self.0.root_node().nth_child(0).start();
-        match self.type_ignore_comment_in_region(0, before_first_statement_end as usize) {
+        match directives.fold_in_range(self.code(), 0, before_first_statement_end) {
             Some(TypeIgnoreComment::WithCodes { codes: code, .. }) => Err(code),
             Some(TypeIgnoreComment::WithoutCode) => Ok(true),
             None => Ok(false),
@@ -476,48 +395,9 @@ impl Tree {
     }
 }
 
-#[derive(Debug)]
-pub enum TypeIgnoreComment<'db> {
-    WithCodes {
-        codes: &'db str,
-        kind: &'static str,
-        codes_start_at_index: CodeIndex,
-        codes_of_later_type_ignores: Vec<&'db str>,
-    },
-    WithoutCode,
-}
-
 pub enum PotentialInlayHint<'db> {
     FunctionDef(FunctionDef<'db>),
     Assignment(Assignment<'db>),
-}
-
-pub fn maybe_type_ignore<'db>(
-    kind: &'static str,
-    start_at: CodeIndex,
-    text: &'db str,
-) -> Option<TypeIgnoreComment<'db>> {
-    if let Some(after) = text.strip_prefix("ignore") {
-        let trimmed = after.trim_start_matches(' ');
-        let start_at = start_at + (text.len() - trimmed.len()) as CodeIndex;
-        let trimmed = trimmed.trim_end_matches(' ');
-        if let Some(trimmed) = trimmed.strip_prefix('[')
-            && let Some(trimmed) = trimmed.strip_suffix(']')
-            && !trimmed.is_empty()
-        {
-            return Some(TypeIgnoreComment::WithCodes {
-                kind,
-                codes: trimmed,
-                codes_start_at_index: start_at + 1,
-                codes_of_later_type_ignores: vec![],
-            });
-        }
-
-        if after.is_empty() || after.starts_with([' ', '\t']) {
-            return Some(TypeIgnoreComment::WithoutCode);
-        }
-    }
-    None
 }
 
 pub trait InterestingNodeSearcher<'db> {
