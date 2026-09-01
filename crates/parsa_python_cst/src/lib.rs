@@ -106,24 +106,44 @@ impl Tree {
         // Returns Some(None) when there is a type: ignore
         // Returns Some("foo") when there is a type: ignore['foo']
         let code = self.code();
-        let relevant_region = if let Some(newline) = code[end as usize..].find(['\n', '\r']) {
-            &code[start as usize..end as usize + newline]
-        } else {
-            &code[start as usize..]
+        let region_end = match code[end as usize..].find(['\n', '\r']) {
+            Some(newline) => end as usize + newline,
+            None => code.len(),
         };
-        Self::type_ignore_comment_for_region(start, relevant_region)
+        self.type_ignore_comment_in_region(start as usize, region_end)
     }
 
-    fn type_ignore_comment_for_region(
-        mut start_at: CodeIndex,
-        region: &str,
+    /// Searches the comments between `start` and `end` for ignore directives. Only actual
+    /// comments are considered, a `#` within e.g. a string literal is never treated as a
+    /// comment.
+    fn type_ignore_comment_in_region(
+        &self,
+        start: usize,
+        end: usize,
     ) -> Option<TypeIgnoreComment<'_>> {
+        let code = self.code();
         let mut result = None;
-        for line in region.split(['\n', '\r']) {
-            let mut iterator = line.split('#');
-            start_at += iterator.next().unwrap().len() as CodeIndex + 1;
-            for comment in iterator {
-                let rest = comment.trim_start_matches(' ');
+        let mut pos = start;
+        while pos < end {
+            let Some(found) = code[pos..end].find('#') else {
+                break;
+            };
+            let hash_start = pos + found;
+            let leaf = self.0.leaf_by_position(hash_start as CodeIndex);
+            if (leaf.start() as usize) <= hash_start && hash_start < leaf.end() as usize {
+                // The '#' is part of a token (e.g. within a string literal) and is
+                // therefore not a comment
+                pos = hash_start + 1;
+                continue;
+            }
+            // A '#' outside of tokens starts a comment that runs to the end of the line
+            let comment_end = code[hash_start..end]
+                .find(['\n', '\r'])
+                .map(|newline| hash_start + newline)
+                .unwrap_or(end);
+            let mut segment_start = hash_start as CodeIndex + 1;
+            for segment in code[hash_start + 1..comment_end].split('#') {
+                let rest = segment.trim_start_matches(' ');
                 let mut kind = "type";
                 if let Some(ignore) = rest.strip_prefix("type:").or_else(|| {
                     kind = "zuban";
@@ -132,7 +152,7 @@ impl Tree {
                     let ignore = ignore.trim_start_matches(' ');
                     let new = maybe_type_ignore(
                         kind,
-                        start_at + (comment.len() - ignore.len()) as CodeIndex,
+                        segment_start + (segment.len() - ignore.len()) as CodeIndex,
                         ignore,
                     );
                     if let Some(new) = new {
@@ -154,24 +174,20 @@ impl Tree {
                         }
                     }
                 }
-                start_at += comment.len() as CodeIndex + 1;
+                segment_start += segment.len() as CodeIndex + 1;
             }
-            start_at += 1;
+            pos = comment_end;
         }
         result
     }
 
     pub fn has_type_ignore_at_start(&self) -> Result<bool, &str> {
-        match Self::type_ignore_comment_for_region(0, self.before_first_statement()) {
+        let before_first_statement_end = self.0.root_node().nth_child(0).start();
+        match self.type_ignore_comment_in_region(0, before_first_statement_end as usize) {
             Some(TypeIgnoreComment::WithCodes { codes: code, .. }) => Err(code),
             Some(TypeIgnoreComment::WithoutCode) => Ok(true),
             None => Ok(false),
         }
-    }
-
-    fn before_first_statement(&self) -> &str {
-        let start = self.0.root_node().nth_child(0).start();
-        &self.code()[0..start as usize]
     }
 
     pub fn mypy_inline_config_directives(&self) -> impl Iterator<Item = (CodeIndex, &str)> {
