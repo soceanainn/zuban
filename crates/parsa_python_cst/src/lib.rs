@@ -105,21 +105,58 @@ impl Tree {
     ) -> Option<TypeIgnoreComment<'_>> {
         // Returns Some(None) when there is a type: ignore
         // Returns Some("foo") when there is a type: ignore['foo']
+        //
+        // Only actual comments count as suppressions. A `#` within e.g. a
+        // string literal does not start a comment, which is why the trivia
+        // between tokens (leaf prefixes) is scanned instead of the raw code
+        // of the region.
         let code = self.code();
-        let relevant_region = if let Some(newline) = code[end as usize..].find(['\n', '\r']) {
-            &code[start as usize..end as usize + newline]
-        } else {
-            &code[start as usize..]
+        let line_end = match code[end as usize..].find(['\n', '\r']) {
+            Some(newline) => end + newline as CodeIndex,
+            None => code.len() as CodeIndex,
         };
-        Self::type_ignore_comment_for_region(start, relevant_region)
+        let mut result = None;
+        let mut leaf = self.0.leaf_by_position(start);
+        loop {
+            let prefix = leaf.prefix_to_previous_leaf();
+            let prefix_start = leaf.start() - prefix.len() as CodeIndex;
+            // Comments before `start` or after the end of the line
+            // containing `end` are not relevant for the issue.
+            let from = prefix_start.max(start);
+            let to = leaf.start().min(line_end);
+            if from < to {
+                Self::add_ignore_directives_in_trivia(
+                    &mut result,
+                    from,
+                    &prefix[(from - prefix_start) as usize..(to - prefix_start) as usize],
+                );
+            }
+            if leaf.start() >= line_end {
+                break;
+            }
+            let Some(next) = leaf.next_leaf() else { break };
+            leaf = next;
+        }
+        result
     }
 
     fn type_ignore_comment_for_region(
-        mut start_at: CodeIndex,
+        start_at: CodeIndex,
         region: &str,
     ) -> Option<TypeIgnoreComment<'_>> {
         let mut result = None;
-        for line in region.split(['\n', '\r']) {
+        Self::add_ignore_directives_in_trivia(&mut result, start_at, region);
+        result
+    }
+
+    fn add_ignore_directives_in_trivia<'code>(
+        result: &mut Option<TypeIgnoreComment<'code>>,
+        mut start_at: CodeIndex,
+        // Must only contain whitespace and comments, where every `#` starts
+        // a comment that reaches until the end of its line.
+        trivia: &'code str,
+    ) {
+        for line in trivia.split(['\n', '\r']) {
             let mut iterator = line.split('#');
             start_at += iterator.next().unwrap().len() as CodeIndex + 1;
             for comment in iterator {
@@ -136,7 +173,7 @@ impl Tree {
                         ignore,
                     );
                     if let Some(new) = new {
-                        if let Some(old) = &mut result {
+                        if let Some(old) = result {
                             match (old, new) {
                                 (
                                     TypeIgnoreComment::WithCodes {
@@ -150,7 +187,7 @@ impl Tree {
                                 (old, _) => *old = TypeIgnoreComment::WithoutCode,
                             }
                         } else {
-                            result = Some(new);
+                            *result = Some(new);
                         }
                     }
                 }
@@ -158,7 +195,6 @@ impl Tree {
             }
             start_at += 1;
         }
-        result
     }
 
     pub fn has_type_ignore_at_start(&self) -> Result<bool, &str> {
